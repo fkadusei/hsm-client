@@ -44,16 +44,92 @@ export HSM_USER_PIN_ENV="MY_CUSTOM_PIN_VAR"
 export MY_CUSTOM_PIN_VAR="1234"
 ```
 
-## Run example
+## Logging
+
+Both example scripts configure rotating file logging automatically.
+
+- Default log file: `logs/hsm-client.log`
+- Rotation policy: 5 backups, 5MB each
+
+Optional logging environment overrides:
 
 ```bash
-python3 examples/basic_flow.py --key-label app-aes-key --message "test payload"
+export HSM_CLIENT_LOG_FILE="logs/hsm-client.log"
+export HSM_CLIENT_LOG_LEVEL="INFO"        # DEBUG, INFO, WARNING, ERROR
+export HSM_CLIENT_LOG_MAX_BYTES="5242880" # 5MB
+export HSM_CLIENT_LOG_BACKUP_COUNT="5"
 ```
 
-Optional AAD (used only when AES-GCM is selected):
+## Basic Flow CLI
+
+`examples/basic_flow.py` supports two modes:
+
+- Encrypt mode (default): requires exactly one of `--message`, `--file`, or `--object`
+- Decrypt mode (`--decrypt`): requires exactly one of `--payload` or `--payload-file`
+
+Output behavior:
+
+- Encrypt mode: emits a JSON payload envelope to stdout, or writes it with `--out`
+- Decrypt mode:
+  - `message` source type: prints plaintext, or writes text with `--out`
+  - `object` source type: prints formatted JSON, or writes JSON with `--out`
+  - `file` source type: prints base64 by default, or writes raw bytes with `--out`
+
+Key label behavior:
+
+- Encrypt: defaults to `app-aes-key` if `--key-label` is not set
+- Decrypt: uses `--key-label` if provided, otherwise uses `key_label` from the payload envelope
+
+### Encryption Examples
+
+Encrypt a quick message:
 
 ```bash
-python3 examples/basic_flow.py --key-label app-aes-key --message "test payload" --aad "request-id=abc123"
+python3 examples/basic_flow.py --message "test payload" --out payload.json
+```
+
+Encrypt a file:
+
+```bash
+python3 examples/basic_flow.py --file ./document.pdf --out document.payload.json
+```
+
+Encrypt a JSON object:
+
+```bash
+python3 examples/basic_flow.py --object '{"user_id":123,"role":"admin"}' --out object.payload.json
+```
+
+Optional AAD for encryption (used only when AES-GCM is selected):
+
+```bash
+python3 examples/basic_flow.py --message "test payload" --aad "request-id=abc123" --out payload.json
+```
+
+### Decryption Examples
+
+Decrypt from payload file:
+
+```bash
+python3 examples/basic_flow.py --decrypt --payload-file payload.json
+```
+
+Decrypt from inline payload JSON string:
+
+```bash
+python3 examples/basic_flow.py --decrypt --payload '{"key_label":"app-aes-key","mechanism":"AES_GCM","iv_or_nonce_b64":"...","ciphertext_b64":"..."}'
+```
+
+Decrypt a file payload back to bytes:
+
+```bash
+python3 examples/basic_flow.py --decrypt --payload-file document.payload.json --out ./document.decrypted.pdf
+```
+
+Decrypt an object payload:
+
+```bash
+python3 examples/basic_flow.py --decrypt --payload-file object.payload.json
 ```
 
 Note: if your HSM does not support AES-GCM, the client falls back to AES-CBC-PAD only when no AAD is provided.
@@ -113,10 +189,12 @@ Test behavior:
 ## Project layout
 
 - `src/hsm_client/config.py`: env-based configuration loader.
+- `src/hsm_client/logging_utils.py`: rotating file logging setup.
 - `src/hsm_client/pkcs11_client.py`: PKCS#11 client wrapper.
 - `examples/basic_flow.py`: end-to-end usage example.
 - `examples/key_lifecycle.py`: key rotation and wrap/unwrap example.
 - `tests/test_softhsm_integration.py`: SoftHSM integration test.
+- `tests/test_logging_utils.py`: logging setup test.
 
 ## Security notes
 

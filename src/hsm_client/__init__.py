@@ -2,6 +2,7 @@
 
 from .config import HsmConfig
 from .exceptions import HsmClientError, HsmConfigurationError, HsmOperationError
+from .logging_utils import configure_logging
 from .pkcs11_client import AesCiphertext, Pkcs11HsmClient, VersionedAesKey
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "HsmOperationError",
     "Pkcs11HsmClient",
     "VersionedAesKey",
+    "configure_logging",
 ]

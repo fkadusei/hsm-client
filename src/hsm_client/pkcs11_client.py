@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import secrets
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ _GCM_FALLBACK_EXCEPTIONS = (
     pkcs11.exceptions.MechanismParamInvalid,
     pkcs11.exceptions.FunctionNotSupported,
 )
+
+_logger = logging.getLogger("hsm_client.client")
 
 
 @dataclass(frozen=True)
@@ -80,36 +83,49 @@ class Pkcs11HsmClient:
 
     def open(self) -> None:
         if self._session is not None:
+            _logger.debug("HSM session already open.")
             return
 
         try:
             if self._config.slot_no is not None:
+                _logger.info("Opening HSM session using slot=%s", self._config.slot_no)
                 token = self._lib.get_token(slot=self._config.slot_no)
             else:
+                _logger.info(
+                    "Opening HSM session using token_label=%s", self._config.token_label
+                )
                 token = self._lib.get_token(token_label=self._config.token_label)
 
             self._session = token.open(user_pin=self._config.user_pin(), rw=True)
+            _logger.info("HSM session opened.")
         except Exception as exc:
+            _logger.exception("Failed to open HSM session.")
             raise HsmOperationError(
                 f"Failed to open HSM session: {_format_exception(exc)}"
             ) from exc
 
     def close(self) -> None:
         if self._session is None:
+            _logger.debug("HSM session already closed.")
             return
         self._session.close()
         self._session = None
+        _logger.info("HSM session closed.")
 
     def get_aes_key(self, label: str) -> pkcs11.SecretKey | None:
         try:
-            return self.session.get_key(
+            key = self.session.get_key(
                 label=label,
                 object_class=ObjectClass.SECRET_KEY,
                 key_type=KeyType.AES,
             )
+            _logger.debug("Loaded AES key label=%s", label)
+            return key
         except pkcs11.exceptions.NoSuchKey:
+            _logger.debug("AES key not found label=%s", label)
             return None
         except Exception as exc:
+            _logger.exception("Failed to load AES key label=%s", label)
             raise HsmOperationError(
                 f"Failed to get key '{label}': {_format_exception(exc)}"
             ) from exc
@@ -128,7 +144,7 @@ class Pkcs11HsmClient:
         if bits not in {128, 192, 256}:
             raise ValueError("AES key size must be 128, 192, or 256 bits.")
         try:
-            return self.session.generate_key(
+            key = self.session.generate_key(
                 KeyType.AES,
                 bits,
                 store=True,
@@ -143,7 +159,19 @@ class Pkcs11HsmClient:
                     Attribute.EXTRACTABLE: extractable,
                 },
             )
+            _logger.info(
+                "Generated AES key label=%s bits=%d extractable=%s encrypt=%s decrypt=%s wrap=%s unwrap=%s",
+                label,
+                bits,
+                extractable,
+                allow_encrypt,
+                allow_decrypt,
+                allow_wrap,
+                allow_unwrap,
+            )
+            return key
         except Exception as exc:
+            _logger.exception("Failed to generate AES key label=%s", label)
             raise HsmOperationError(
                 f"Failed to generate key '{label}': {_format_exception(exc)}"
             ) from exc
@@ -207,11 +235,15 @@ class Pkcs11HsmClient:
                     )
                 )
         except Exception as exc:
+            _logger.exception("Failed listing versioned keys base_label=%s", base_label)
             raise HsmOperationError(
                 f"Failed to list AES key versions for '{base_label}': {_format_exception(exc)}"
             ) from exc
 
         versions.sort(key=lambda item: item.version)
+        _logger.debug(
+            "Found %d versioned AES keys for base_label=%s", len(versions), base_label
+        )
         return versions
 
     def get_latest_aes_key(
@@ -220,6 +252,7 @@ class Pkcs11HsmClient:
         """Get the highest-version AES key for a base label."""
         versions = self.list_aes_key_versions(base_label)
         if not versions:
+            _logger.debug("No versioned keys exist for base_label=%s", base_label)
             return None
 
         latest = versions[-1]
@@ -247,6 +280,12 @@ class Pkcs11HsmClient:
         next_version = versions[-1].version + 1 if versions else 1
         label = self.format_versioned_label(base_label, next_version, width=version_width)
         key = self.generate_aes_key(label=label, bits=bits, extractable=extractable)
+        _logger.info(
+            "Rotated AES key base_label=%s new_label=%s version=%d",
+            base_label,
+            label,
+            next_version,
+        )
         return VersionedAesKey(base_label=base_label, version=next_version, label=label), key
 
     def wrap_aes_key(
@@ -262,8 +301,15 @@ class Pkcs11HsmClient:
         Note: many PKCS#11 providers require the target key to be extractable.
         """
         try:
-            return wrapping_key.wrap_key(target_key, mechanism=mechanism)
+            wrapped = wrapping_key.wrap_key(target_key, mechanism=mechanism)
+            _logger.info(
+                "Wrapped AES key using mechanism=%s wrapped_size=%d",
+                mechanism.name if hasattr(mechanism, "name") else mechanism,
+                len(wrapped),
+            )
+            return wrapped
         except Exception as exc:
+            _logger.exception("Failed to wrap AES key.")
             raise HsmOperationError(
                 f"Failed to wrap key: {_format_exception(exc)}"
             ) from exc
@@ -279,7 +325,7 @@ class Pkcs11HsmClient:
     ) -> pkcs11.SecretKey:
         """Unwrap an AES key with a KEK and store it on token."""
         try:
-            return wrapping_key.unwrap_key(
+            key = wrapping_key.unwrap_key(
                 ObjectClass.SECRET_KEY,
                 KeyType.AES,
                 wrapped_key,
@@ -294,7 +340,15 @@ class Pkcs11HsmClient:
                     Attribute.EXTRACTABLE: extractable,
                 },
             )
+            _logger.info(
+                "Unwrapped AES key label=%s mechanism=%s extractable=%s",
+                label,
+                mechanism.name if hasattr(mechanism, "name") else mechanism,
+                extractable,
+            )
+            return key
         except Exception as exc:
+            _logger.exception("Failed to unwrap AES key label=%s", label)
             raise HsmOperationError(
                 f"Failed to unwrap key '{label}': {_format_exception(exc)}"
             ) from exc
@@ -322,8 +376,14 @@ class Pkcs11HsmClient:
                 mechanism=Mechanism.AES_GCM,
                 mechanism_param=params,
             )
+            _logger.debug(
+                "AES-GCM encryption complete plaintext_size=%d ciphertext_size=%d",
+                len(plaintext),
+                len(ciphertext),
+            )
             return nonce, ciphertext
         except Exception as exc:
+            _logger.exception("AES-GCM encryption failed.")
             raise HsmOperationError(
                 f"AES-GCM encryption failed: {_format_exception(exc)}"
             ) from exc
@@ -343,12 +403,19 @@ class Pkcs11HsmClient:
 
         try:
             params = pkcs11.GCMParams(nonce=nonce, aad=aad, tag_bits=tag_bits)
-            return key.decrypt(
+            plaintext = key.decrypt(
                 ciphertext,
                 mechanism=Mechanism.AES_GCM,
                 mechanism_param=params,
             )
+            _logger.debug(
+                "AES-GCM decryption complete ciphertext_size=%d plaintext_size=%d",
+                len(ciphertext),
+                len(plaintext),
+            )
+            return plaintext
         except Exception as exc:
+            _logger.exception("AES-GCM decryption failed.")
             raise HsmOperationError(
                 f"AES-GCM decryption failed: {_format_exception(exc)}"
             ) from exc
@@ -366,8 +433,14 @@ class Pkcs11HsmClient:
                 mechanism=Mechanism.AES_CBC_PAD,
                 mechanism_param=iv,
             )
+            _logger.debug(
+                "AES-CBC encryption complete plaintext_size=%d ciphertext_size=%d",
+                len(plaintext),
+                len(ciphertext),
+            )
             return iv, ciphertext
         except Exception as exc:
+            _logger.exception("AES-CBC encryption failed.")
             raise HsmOperationError(
                 f"Encryption failed: {_format_exception(exc)}"
             ) from exc
@@ -376,12 +449,19 @@ class Pkcs11HsmClient:
         if len(iv) != 16:
             raise ValueError("AES-CBC IV must be 16 bytes.")
         try:
-            return key.decrypt(
+            plaintext = key.decrypt(
                 ciphertext,
                 mechanism=Mechanism.AES_CBC_PAD,
                 mechanism_param=iv,
             )
+            _logger.debug(
+                "AES-CBC decryption complete ciphertext_size=%d plaintext_size=%d",
+                len(ciphertext),
+                len(plaintext),
+            )
+            return plaintext
         except Exception as exc:
+            _logger.exception("AES-CBC decryption failed.")
             raise HsmOperationError(
                 f"Decryption failed: {_format_exception(exc)}"
             ) from exc
@@ -410,6 +490,7 @@ class Pkcs11HsmClient:
                 )
             except HsmOperationError as exc:
                 if isinstance(exc.__cause__, _GCM_FALLBACK_EXCEPTIONS):
+                    _logger.warning("AES-GCM unavailable, falling back to AES-CBC-PAD.")
                     if aad is not None:
                         raise HsmOperationError(
                             "AES-GCM is unavailable and AES-CBC fallback does not support AAD."

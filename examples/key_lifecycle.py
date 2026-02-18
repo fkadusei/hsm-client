@@ -12,7 +12,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(repo_src))
 
 try:
-    from hsm_client import HsmConfig, HsmClientError, Pkcs11HsmClient
+    from hsm_client import HsmConfig, HsmClientError, Pkcs11HsmClient, configure_logging
 except ModuleNotFoundError as exc:
     if exc.name == "pkcs11":
         raise SystemExit(
@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        configure_logging()
         config = HsmConfig.from_env()
         with Pkcs11HsmClient(config) as client:
             # 1) Rotate key versions.
@@ -104,8 +105,8 @@ def main() -> int:
             print(f"Transfer key round-trip: {transfer_plaintext}")
 
         return 0
-    except HsmClientError as exc:
-        print(f"HSM error: {exc}", file=sys.stderr)
+    except (HsmClientError, ValueError) as exc:
+        print(f"Client error: {exc}", file=sys.stderr)
         return 1
 
 
