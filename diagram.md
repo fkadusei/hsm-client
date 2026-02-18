@@ -4,6 +4,7 @@ sequenceDiagram
     participant HSM
     participant Token as Token/Partition
 
+
     App->>PKCS11: Load library (.so / .dll)
     App->>PKCS11: C_Initialize()
     App->>PKCS11: C_GetSlotList()
