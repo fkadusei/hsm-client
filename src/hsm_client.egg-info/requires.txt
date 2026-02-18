@@ -1,0 +1,4 @@
+python-pkcs11>=0.7.0
+
+[dev]
+pytest>=8.0

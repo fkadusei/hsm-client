@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+src/hsm_client/__init__.py
+src/hsm_client/config.py
+src/hsm_client/exceptions.py
+src/hsm_client/pkcs11_client.py
+src/hsm_client.egg-info/PKG-INFO
+src/hsm_client.egg-info/SOURCES.txt
+src/hsm_client.egg-info/dependency_links.txt
+src/hsm_client.egg-info/requires.txt
+src/hsm_client.egg-info/top_level.txt
+tests/test_softhsm_integration.py
