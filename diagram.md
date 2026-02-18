@@ -1,3 +1,6 @@
+# hsm-client flow
+
+```mermaid
 sequenceDiagram
     participant App
     participant PKCS11 as PKCS#11 Library
@@ -16,3 +19,4 @@ sequenceDiagram
     PKCS11->>HSM: Perform crypto operation
     HSM-->>PKCS11: Signature
     PKCS11-->>App: Signature returned
+```
