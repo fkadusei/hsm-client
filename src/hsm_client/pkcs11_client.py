@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import pkcs11
-from pkcs11 import Attribute, KeyType, Mechanism, ObjectClass
+import pkcs11.util.ec as ec_util
+from pkcs11 import Attribute, KeyType, Mechanism, MGF, ObjectClass
 
+from .asymmetric_profiles import AsymmetricKeyProfile, get_key_profile, list_key_profiles
 from .config import HsmConfig
 from .exceptions import HsmOperationError
 
@@ -54,6 +56,105 @@ class VersionedAesKey:
     base_label: str
     version: int
     label: str
+
+
+@dataclass(frozen=True)
+class SignatureAlgorithmSpec:
+    """PKCS#11 mechanism mapping for a signing algorithm."""
+
+    key_type: KeyType
+    mechanism: Mechanism
+    mechanism_param: tuple[Mechanism, MGF, int] | None = None
+
+
+@dataclass(frozen=True)
+class AsymmetricEncryptionAlgorithmSpec:
+    """PKCS#11 mechanism mapping for asymmetric confidentiality operations."""
+
+    key_type: KeyType
+    mechanism: Mechanism
+    mechanism_param: tuple[Mechanism, MGF, bytes | None] | None = None
+
+
+SIGNATURE_ALGORITHM_SPECS: dict[str, SignatureAlgorithmSpec] = {
+    "rsa_pkcs1v15_sha256": SignatureAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.SHA256_RSA_PKCS,
+    ),
+    "rsa_pkcs1v15_sha384": SignatureAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.SHA384_RSA_PKCS,
+    ),
+    "rsa_pss_sha256": SignatureAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.SHA256_RSA_PKCS_PSS,
+        mechanism_param=(Mechanism.SHA256, MGF.SHA256, 32),
+    ),
+    "rsa_pss_sha384": SignatureAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.SHA384_RSA_PKCS_PSS,
+        mechanism_param=(Mechanism.SHA384, MGF.SHA384, 48),
+    ),
+    "ecdsa_sha256": SignatureAlgorithmSpec(
+        key_type=KeyType.EC,
+        mechanism=Mechanism.ECDSA_SHA256,
+    ),
+    "ecdsa_sha384": SignatureAlgorithmSpec(
+        key_type=KeyType.EC,
+        mechanism=Mechanism.ECDSA_SHA384,
+    ),
+}
+
+ASYMMETRIC_ENCRYPTION_ALGORITHM_SPECS: dict[str, AsymmetricEncryptionAlgorithmSpec] = {
+    "rsa_oaep_sha1": AsymmetricEncryptionAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.RSA_PKCS_OAEP,
+        mechanism_param=(Mechanism.SHA_1, MGF.SHA1, None),
+    ),
+    "rsa_oaep_sha256": AsymmetricEncryptionAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.RSA_PKCS_OAEP,
+        mechanism_param=(Mechanism.SHA256, MGF.SHA256, None),
+    ),
+    "rsa_oaep_sha384": AsymmetricEncryptionAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.RSA_PKCS_OAEP,
+        mechanism_param=(Mechanism.SHA384, MGF.SHA384, None),
+    ),
+    "rsa_pkcs1v15": AsymmetricEncryptionAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.RSA_PKCS,
+        mechanism_param=None,
+    ),
+}
+
+
+def _normalize_algorithm_name(algorithm: str) -> str:
+    return algorithm.strip().lower().replace("-", "_")
+
+
+def _resolve_signature_algorithm(algorithm: str) -> SignatureAlgorithmSpec:
+    normalized = _normalize_algorithm_name(algorithm)
+    spec = SIGNATURE_ALGORITHM_SPECS.get(normalized)
+    if spec is None:
+        available = ", ".join(sorted(SIGNATURE_ALGORITHM_SPECS.keys()))
+        raise ValueError(
+            f"Unsupported signing algorithm '{algorithm}'. Available: {available}"
+        )
+    return spec
+
+
+def _resolve_asymmetric_encryption_algorithm(
+    algorithm: str,
+) -> AsymmetricEncryptionAlgorithmSpec:
+    normalized = _normalize_algorithm_name(algorithm)
+    spec = ASYMMETRIC_ENCRYPTION_ALGORITHM_SPECS.get(normalized)
+    if spec is None:
+        available = ", ".join(sorted(ASYMMETRIC_ENCRYPTION_ALGORITHM_SPECS.keys()))
+        raise ValueError(
+            f"Unsupported asymmetric encryption algorithm '{algorithm}'. Available: {available}"
+        )
+    return spec
 
 
 class Pkcs11HsmClient:
@@ -128,6 +229,376 @@ class Pkcs11HsmClient:
             _logger.exception("Failed to load AES key label=%s", label)
             raise HsmOperationError(
                 f"Failed to get key '{label}': {_format_exception(exc)}"
+            ) from exc
+
+    @staticmethod
+    def list_key_profiles() -> tuple[str, ...]:
+        return list_key_profiles()
+
+    @staticmethod
+    def get_key_profile(name: str) -> AsymmetricKeyProfile:
+        return get_key_profile(name)
+
+    @staticmethod
+    def list_signing_algorithms() -> tuple[str, ...]:
+        return tuple(sorted(SIGNATURE_ALGORITHM_SPECS.keys()))
+
+    @staticmethod
+    def list_asymmetric_encryption_algorithms() -> tuple[str, ...]:
+        return tuple(sorted(ASYMMETRIC_ENCRYPTION_ALGORITHM_SPECS.keys()))
+
+    def generate_keypair_for_profile(
+        self,
+        profile_name: str,
+        private_label: str,
+        public_label: str | None = None,
+        *,
+        extractable: bool | None = None,
+        key_id: bytes | None = None,
+    ) -> tuple[pkcs11.PublicKey, pkcs11.PrivateKey]:
+        profile = get_key_profile(profile_name)
+        resolved_extractable = (
+            profile.extractable if extractable is None else extractable
+        )
+
+        if profile.key_type == "RSA":
+            if profile.rsa_bits is None:
+                raise ValueError(
+                    f"Profile '{profile.name}' is RSA but rsa_bits is not configured."
+                )
+            return self.generate_rsa_keypair(
+                private_label=private_label,
+                public_label=public_label,
+                bits=profile.rsa_bits,
+                extractable=resolved_extractable,
+                key_id=key_id,
+            )
+        if profile.key_type == "EC":
+            if profile.ec_curve is None:
+                raise ValueError(
+                    f"Profile '{profile.name}' is EC but ec_curve is not configured."
+                )
+            return self.generate_ec_keypair(
+                private_label=private_label,
+                public_label=public_label,
+                curve=profile.ec_curve,
+                extractable=resolved_extractable,
+                key_id=key_id,
+            )
+        raise ValueError(f"Unsupported profile key type: {profile.key_type}")
+
+    def generate_rsa_keypair(
+        self,
+        private_label: str,
+        public_label: str | None = None,
+        bits: int = 3072,
+        *,
+        extractable: bool = False,
+        key_id: bytes | None = None,
+        allow_sign: bool = True,
+        allow_verify: bool = True,
+        allow_decrypt: bool = False,
+        allow_encrypt: bool = False,
+    ) -> tuple[pkcs11.PublicKey, pkcs11.PrivateKey]:
+        if bits not in {2048, 3072, 4096}:
+            raise ValueError("RSA key size must be one of: 2048, 3072, 4096.")
+
+        resolved_public_label = public_label or f"{private_label}.pub"
+        try:
+            public_key, private_key = self.session.generate_keypair(
+                KeyType.RSA,
+                bits,
+                id=key_id,
+                store=True,
+                public_template={
+                    Attribute.LABEL: resolved_public_label,
+                    Attribute.TOKEN: True,
+                    Attribute.VERIFY: allow_verify,
+                    Attribute.ENCRYPT: allow_encrypt,
+                },
+                private_template={
+                    Attribute.LABEL: private_label,
+                    Attribute.TOKEN: True,
+                    Attribute.SENSITIVE: True,
+                    Attribute.EXTRACTABLE: extractable,
+                    Attribute.SIGN: allow_sign,
+                    Attribute.DECRYPT: allow_decrypt,
+                },
+            )
+            _logger.info(
+                "Generated RSA keypair private_label=%s public_label=%s bits=%d extractable=%s",
+                private_label,
+                resolved_public_label,
+                bits,
+                extractable,
+            )
+            return public_key, private_key
+        except Exception as exc:
+            _logger.exception(
+                "Failed to generate RSA keypair private_label=%s public_label=%s",
+                private_label,
+                resolved_public_label,
+            )
+            raise HsmOperationError(
+                f"Failed to generate RSA keypair '{private_label}': {_format_exception(exc)}"
+            ) from exc
+
+    def generate_ec_keypair(
+        self,
+        private_label: str,
+        public_label: str | None = None,
+        curve: str = "secp256r1",
+        *,
+        extractable: bool = False,
+        key_id: bytes | None = None,
+        allow_sign: bool = True,
+        allow_verify: bool = True,
+        allow_derive: bool = False,
+    ) -> tuple[pkcs11.PublicKey, pkcs11.PrivateKey]:
+        resolved_public_label = public_label or f"{private_label}.pub"
+
+        try:
+            ec_params = ec_util.encode_named_curve_parameters(curve)
+        except Exception as exc:
+            raise ValueError(f"Unsupported EC curve '{curve}'.") from exc
+
+        try:
+            parameters = self.session.create_domain_parameters(
+                KeyType.EC,
+                {Attribute.EC_PARAMS: ec_params},
+                local=True,
+            )
+            public_key, private_key = parameters.generate_keypair(
+                id=key_id,
+                store=True,
+                public_template={
+                    Attribute.LABEL: resolved_public_label,
+                    Attribute.TOKEN: True,
+                    Attribute.VERIFY: allow_verify,
+                    Attribute.DERIVE: allow_derive,
+                },
+                private_template={
+                    Attribute.LABEL: private_label,
+                    Attribute.TOKEN: True,
+                    Attribute.SENSITIVE: True,
+                    Attribute.EXTRACTABLE: extractable,
+                    Attribute.SIGN: allow_sign,
+                    Attribute.DERIVE: allow_derive,
+                },
+            )
+            _logger.info(
+                "Generated EC keypair private_label=%s public_label=%s curve=%s extractable=%s",
+                private_label,
+                resolved_public_label,
+                curve,
+                extractable,
+            )
+            return public_key, private_key
+        except Exception as exc:
+            _logger.exception(
+                "Failed to generate EC keypair private_label=%s public_label=%s curve=%s",
+                private_label,
+                resolved_public_label,
+                curve,
+            )
+            raise HsmOperationError(
+                f"Failed to generate EC keypair '{private_label}': {_format_exception(exc)}"
+            ) from exc
+
+    def get_private_key(
+        self, label: str, key_type: KeyType | None = None
+    ) -> pkcs11.PrivateKey | None:
+        try:
+            private_key = self.session.get_key(
+                label=label,
+                object_class=ObjectClass.PRIVATE_KEY,
+                key_type=key_type,
+            )
+            _logger.debug("Loaded private key label=%s key_type=%s", label, key_type)
+            return private_key
+        except pkcs11.exceptions.NoSuchKey:
+            _logger.debug("Private key not found label=%s key_type=%s", label, key_type)
+            return None
+        except Exception as exc:
+            _logger.exception("Failed to load private key label=%s", label)
+            raise HsmOperationError(
+                f"Failed to get private key '{label}': {_format_exception(exc)}"
+            ) from exc
+
+    def get_public_key(
+        self, label: str, key_type: KeyType | None = None
+    ) -> pkcs11.PublicKey | None:
+        try:
+            public_key = self.session.get_key(
+                label=label,
+                object_class=ObjectClass.PUBLIC_KEY,
+                key_type=key_type,
+            )
+            _logger.debug("Loaded public key label=%s key_type=%s", label, key_type)
+            return public_key
+        except pkcs11.exceptions.NoSuchKey:
+            _logger.debug("Public key not found label=%s key_type=%s", label, key_type)
+            return None
+        except Exception as exc:
+            _logger.exception("Failed to load public key label=%s", label)
+            raise HsmOperationError(
+                f"Failed to get public key '{label}': {_format_exception(exc)}"
+            ) from exc
+
+    def sign(
+        self,
+        private_key: pkcs11.PrivateKey,
+        data: bytes,
+        algorithm: str = "rsa_pss_sha256",
+    ) -> bytes:
+        spec = _resolve_signature_algorithm(algorithm)
+        try:
+            actual_key_type = private_key[Attribute.KEY_TYPE]
+            if actual_key_type != spec.key_type:
+                raise ValueError(
+                    f"Algorithm '{algorithm}' requires key type {spec.key_type.name}, "
+                    f"but key type is {actual_key_type}."
+                )
+        except (KeyError, TypeError):
+            # Some providers may not expose KEY_TYPE for loaded objects.
+            pass
+        try:
+            signature = private_key.sign(
+                data,
+                mechanism=spec.mechanism,
+                mechanism_param=spec.mechanism_param,
+            )
+            _logger.info(
+                "Signed payload using algorithm=%s signature_size=%d",
+                _normalize_algorithm_name(algorithm),
+                len(signature),
+            )
+            return signature
+        except Exception as exc:
+            _logger.exception("Signing failed algorithm=%s", algorithm)
+            raise HsmOperationError(
+                f"Signing failed for algorithm '{algorithm}': {_format_exception(exc)}"
+            ) from exc
+
+    def verify(
+        self,
+        public_key: pkcs11.PublicKey,
+        data: bytes,
+        signature: bytes,
+        algorithm: str = "rsa_pss_sha256",
+    ) -> bool:
+        spec = _resolve_signature_algorithm(algorithm)
+        try:
+            actual_key_type = public_key[Attribute.KEY_TYPE]
+            if actual_key_type != spec.key_type:
+                raise ValueError(
+                    f"Algorithm '{algorithm}' requires key type {spec.key_type.name}, "
+                    f"but key type is {actual_key_type}."
+                )
+        except (KeyError, TypeError):
+            # Some providers may not expose KEY_TYPE for loaded objects.
+            pass
+        try:
+            verified = public_key.verify(
+                data,
+                signature,
+                mechanism=spec.mechanism,
+                mechanism_param=spec.mechanism_param,
+            )
+            _logger.info(
+                "Verified signature using algorithm=%s result=%s",
+                _normalize_algorithm_name(algorithm),
+                verified,
+            )
+            return bool(verified)
+        except pkcs11.exceptions.SignatureInvalid:
+            _logger.warning(
+                "Signature verification failed (invalid signature) algorithm=%s",
+                _normalize_algorithm_name(algorithm),
+            )
+            return False
+        except Exception as exc:
+            _logger.exception("Signature verification failed algorithm=%s", algorithm)
+            raise HsmOperationError(
+                f"Verification failed for algorithm '{algorithm}': {_format_exception(exc)}"
+            ) from exc
+
+    def encrypt_confidential(
+        self,
+        public_key: pkcs11.PublicKey,
+        plaintext: bytes,
+        algorithm: str = "rsa_oaep_sha256",
+    ) -> bytes:
+        """
+        Encrypt data for confidentiality using an asymmetric public key.
+
+        This is separate from signing and should be paired with decrypt_confidential().
+        """
+        spec = _resolve_asymmetric_encryption_algorithm(algorithm)
+        try:
+            actual_key_type = public_key[Attribute.KEY_TYPE]
+            if actual_key_type != spec.key_type:
+                raise ValueError(
+                    f"Algorithm '{algorithm}' requires key type {spec.key_type.name}, "
+                    f"but key type is {actual_key_type}."
+                )
+        except (KeyError, TypeError):
+            pass
+
+        try:
+            ciphertext = public_key.encrypt(
+                plaintext,
+                mechanism=spec.mechanism,
+                mechanism_param=spec.mechanism_param,
+            )
+            _logger.info(
+                "Asymmetric encryption complete algorithm=%s plaintext_size=%d ciphertext_size=%d",
+                _normalize_algorithm_name(algorithm),
+                len(plaintext),
+                len(ciphertext),
+            )
+            return ciphertext
+        except Exception as exc:
+            _logger.exception("Asymmetric encryption failed algorithm=%s", algorithm)
+            raise HsmOperationError(
+                f"Asymmetric encryption failed for algorithm '{algorithm}': {_format_exception(exc)}"
+            ) from exc
+
+    def decrypt_confidential(
+        self,
+        private_key: pkcs11.PrivateKey,
+        ciphertext: bytes,
+        algorithm: str = "rsa_oaep_sha256",
+    ) -> bytes:
+        """Decrypt ciphertext produced by encrypt_confidential()."""
+        spec = _resolve_asymmetric_encryption_algorithm(algorithm)
+        try:
+            actual_key_type = private_key[Attribute.KEY_TYPE]
+            if actual_key_type != spec.key_type:
+                raise ValueError(
+                    f"Algorithm '{algorithm}' requires key type {spec.key_type.name}, "
+                    f"but key type is {actual_key_type}."
+                )
+        except (KeyError, TypeError):
+            pass
+
+        try:
+            plaintext = private_key.decrypt(
+                ciphertext,
+                mechanism=spec.mechanism,
+                mechanism_param=spec.mechanism_param,
+            )
+            _logger.info(
+                "Asymmetric decryption complete algorithm=%s ciphertext_size=%d plaintext_size=%d",
+                _normalize_algorithm_name(algorithm),
+                len(ciphertext),
+                len(plaintext),
+            )
+            return plaintext
+        except Exception as exc:
+            _logger.exception("Asymmetric decryption failed algorithm=%s", algorithm)
+            raise HsmOperationError(
+                f"Asymmetric decryption failed for algorithm '{algorithm}': {_format_exception(exc)}"
             ) from exc
 
     def generate_aes_key(

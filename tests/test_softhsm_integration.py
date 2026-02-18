@@ -245,3 +245,155 @@ def test_wrap_unwrap_aes_key(
 
         payload = client.encrypt_aes(unwrapped_key, b"wrapped-transfer-check")
         assert client.decrypt_aes(unwrapped_key, payload) == b"wrapped-transfer-check"
+
+
+def test_generate_rsa_keypair_and_sign_verify(
+    softhsm_runtime: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SOFTHSM2_CONF", softhsm_runtime["softhsm2_conf"])
+    monkeypatch.setenv("HSM_PKCS11_MODULE", softhsm_runtime["module_path"])
+    monkeypatch.setenv("HSM_TOKEN_LABEL", softhsm_runtime["token_label"])
+    monkeypatch.setenv("HSM_USER_PIN", softhsm_runtime["user_pin"])
+
+    config = HsmConfig.from_env()
+    private_label = f"rsa-priv-{uuid.uuid4().hex[:8]}"
+    public_label = f"rsa-pub-{uuid.uuid4().hex[:8]}"
+    payload = b"rsa-signing-payload"
+
+    with Pkcs11HsmClient(config) as client:
+        client.generate_rsa_keypair(
+            private_label=private_label,
+            public_label=public_label,
+            bits=2048,
+            extractable=False,
+        )
+        private_key = client.get_private_key(private_label, key_type=pkcs11.KeyType.RSA)
+        public_key = client.get_public_key(public_label, key_type=pkcs11.KeyType.RSA)
+        assert private_key is not None
+        assert public_key is not None
+
+        for algorithm in (
+            "rsa_pkcs1v15_sha256",
+            "rsa_pkcs1v15_sha384",
+            "rsa_pss_sha256",
+            "rsa_pss_sha384",
+        ):
+            signature = client.sign(private_key, payload, algorithm=algorithm)
+            assert client.verify(public_key, payload, signature, algorithm=algorithm)
+            assert not client.verify(
+                public_key,
+                payload + b"-tampered",
+                signature,
+                algorithm=algorithm,
+            )
+
+
+def test_generate_ec_keypair_from_profile_and_sign_verify(
+    softhsm_runtime: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SOFTHSM2_CONF", softhsm_runtime["softhsm2_conf"])
+    monkeypatch.setenv("HSM_PKCS11_MODULE", softhsm_runtime["module_path"])
+    monkeypatch.setenv("HSM_TOKEN_LABEL", softhsm_runtime["token_label"])
+    monkeypatch.setenv("HSM_USER_PIN", softhsm_runtime["user_pin"])
+
+    config = HsmConfig.from_env()
+    mtls_label = f"mtls-ec-priv-{uuid.uuid4().hex[:8]}"
+    ca_label = f"ca-ec-priv-{uuid.uuid4().hex[:8]}"
+
+    with Pkcs11HsmClient(config) as client:
+        profiles = set(client.list_key_profiles())
+        assert {"ca_root", "ca_intermediate", "mtls_server", "mtls_client", "signing"}.issubset(
+            profiles
+        )
+
+        mtls_public, mtls_private = client.generate_keypair_for_profile(
+            "mtls_server",
+            private_label=mtls_label,
+        )
+        mtls_payload = b"mtls-ecdsa-payload"
+        mtls_signature = client.sign(mtls_private, mtls_payload, algorithm="ecdsa_sha256")
+        assert client.verify(mtls_public, mtls_payload, mtls_signature, algorithm="ecdsa_sha256")
+
+        ca_public, ca_private = client.generate_keypair_for_profile(
+            "ca_root",
+            private_label=ca_label,
+        )
+        ca_payload = b"ca-ecdsa-payload"
+        ca_signature = client.sign(ca_private, ca_payload, algorithm="ecdsa_sha384")
+        assert client.verify(ca_public, ca_payload, ca_signature, algorithm="ecdsa_sha384")
+
+        loaded_private = client.get_private_key(mtls_label, key_type=pkcs11.KeyType.EC)
+        loaded_public = client.get_public_key(f"{mtls_label}.pub", key_type=pkcs11.KeyType.EC)
+        assert loaded_private is not None
+        assert loaded_public is not None
+
+        with pytest.raises(ValueError):
+            client.generate_keypair_for_profile(
+                "unknown-profile",
+                private_label="does-not-matter",
+            )
+
+
+def test_asymmetric_confidentiality_encrypt_decrypt(
+    softhsm_runtime: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SOFTHSM2_CONF", softhsm_runtime["softhsm2_conf"])
+    monkeypatch.setenv("HSM_PKCS11_MODULE", softhsm_runtime["module_path"])
+    monkeypatch.setenv("HSM_TOKEN_LABEL", softhsm_runtime["token_label"])
+    monkeypatch.setenv("HSM_USER_PIN", softhsm_runtime["user_pin"])
+
+    config = HsmConfig.from_env()
+    private_label = f"rsa-conf-priv-{uuid.uuid4().hex[:8]}"
+    public_label = f"rsa-conf-pub-{uuid.uuid4().hex[:8]}"
+    plaintext = b"confidential-message"
+
+    with Pkcs11HsmClient(config) as client:
+        public_key, private_key = client.generate_rsa_keypair(
+            private_label=private_label,
+            public_label=public_label,
+            bits=2048,
+            extractable=False,
+            allow_sign=False,
+            allow_verify=False,
+            allow_encrypt=True,
+            allow_decrypt=True,
+        )
+
+        # Always expected to work with PKCS#1 v1.5 when RSA encryption is enabled.
+        ciphertext_pkcs1 = client.encrypt_confidential(
+            public_key,
+            plaintext,
+            algorithm="rsa_pkcs1v15",
+        )
+        recovered_pkcs1 = client.decrypt_confidential(
+            private_key,
+            ciphertext_pkcs1,
+            algorithm="rsa_pkcs1v15",
+        )
+        assert recovered_pkcs1 == plaintext
+
+        # OAEP-SHA1 is widely supported and used as compatibility baseline here.
+        ciphertext_oaep = client.encrypt_confidential(
+            public_key,
+            plaintext,
+            algorithm="rsa_oaep_sha1",
+        )
+        recovered_oaep = client.decrypt_confidential(
+            private_key,
+            ciphertext_oaep,
+            algorithm="rsa_oaep_sha1",
+        )
+        assert recovered_oaep == plaintext
+
+        # Wrong algorithm for decrypt should not yield the original plaintext.
+        # Some providers raise immediately, others may return undecodable bytes.
+        try:
+            mismatched = client.decrypt_confidential(
+                private_key,
+                ciphertext_oaep,
+                algorithm="rsa_pkcs1v15",
+            )
+        except HsmOperationError:
+            pass
+        else:
+            assert mismatched != plaintext

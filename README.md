@@ -10,6 +10,8 @@ Minimal Python starter for connecting to an HSM over `PKCS#11` and performing sy
 - Prefers AES-GCM and falls back to AES-CBC-PAD when GCM is unavailable.
 - Enforces non-exportable keys by default (`CKA_EXTRACTABLE=false`).
 - Supports key lifecycle workflows: versioned rotation and key wrap/unwrap.
+- Supports asymmetric key operations for CA, mTLS, and digital signing profiles.
+- Supports asymmetric confidentiality flow (public-key encrypt, private-key decrypt).
 
 ## Prerequisites
 
@@ -148,6 +150,74 @@ What it demonstrates:
 
 Important: many PKCS#11 providers require wrapped keys to be extractable at wrap time. Keep production application keys non-extractable unless you intentionally support wrapped export workflows.
 
+## Asymmetric key operations (Phase 1-3)
+
+The client now includes:
+
+- key profiles: `ca_root`, `ca_intermediate`, `mtls_server`, `mtls_client`, `signing`
+- keypair generation:
+  - `generate_rsa_keypair(...)`
+  - `generate_ec_keypair(...)`
+  - `generate_keypair_for_profile(...)`
+- key retrieval:
+  - `get_private_key(...)`
+  - `get_public_key(...)`
+- signing/verification with explicit mechanism mapping:
+  - `rsa_pkcs1v15_sha256`, `rsa_pkcs1v15_sha384`
+  - `rsa_pss_sha256`, `rsa_pss_sha384`
+  - `ecdsa_sha256`, `ecdsa_sha384`
+- confidentiality encryption/decryption with explicit mechanism mapping:
+  - `rsa_oaep_sha1`, `rsa_oaep_sha256`, `rsa_oaep_sha384`
+  - `rsa_pkcs1v15`
+
+Python usage example:
+
+```python
+from hsm_client import HsmConfig, Pkcs11HsmClient
+
+config = HsmConfig.from_env()
+with Pkcs11HsmClient(config) as client:
+    public_key, private_key = client.generate_keypair_for_profile(
+        "mtls_server",
+        private_label="mtls-server-key",
+    )
+    message = b"hello-signature"
+    signature = client.sign(private_key, message, algorithm="ecdsa_sha256")
+    assert client.verify(public_key, message, signature, algorithm="ecdsa_sha256")
+```
+
+## Confidentiality flow (public key encrypt, private key decrypt)
+
+Use the dedicated example:
+
+```bash
+python3 examples/confidentiality_flow.py \
+  --private-label app-confidentiality-rsa \
+  --message "confidential payload"
+```
+
+What it does:
+
+- Loads an existing RSA confidentiality keypair by label, or generates one.
+- Encrypts with the public key.
+- Decrypts with the private key.
+- Prints ciphertext (base64) and recovered plaintext.
+
+Try a specific algorithm:
+
+```bash
+python3 examples/confidentiality_flow.py \
+  --algorithm rsa_pkcs1v15 \
+  --message "confidential payload"
+```
+
+Supported algorithms:
+
+- `rsa_oaep_sha1` (default in the example for broad compatibility)
+- `rsa_oaep_sha256`
+- `rsa_oaep_sha384`
+- `rsa_pkcs1v15`
+
 ## Troubleshooting
 
 If you see `ModuleNotFoundError: No module named 'pkcs11'`, your current Python interpreter does not have `python-pkcs11` installed.
@@ -184,15 +254,19 @@ Test behavior:
 - Verifies AES-GCM with AAD when supported by the provider.
 - Verifies versioned rotation (`-v0001`, `-v0002`) and latest-key lookup.
 - Verifies AES key wrap/unwrap flows.
+- Verifies asymmetric signing/verification for RSA and EC keys.
+- Verifies asymmetric confidentiality encrypt/decrypt flows.
 - Skips cleanly if SoftHSM is not installed.
 
 ## Project layout
 
 - `src/hsm_client/config.py`: env-based configuration loader.
+- `src/hsm_client/asymmetric_profiles.py`: asymmetric key profile definitions.
 - `src/hsm_client/logging_utils.py`: rotating file logging setup.
 - `src/hsm_client/pkcs11_client.py`: PKCS#11 client wrapper.
 - `examples/basic_flow.py`: end-to-end usage example.
 - `examples/key_lifecycle.py`: key rotation and wrap/unwrap example.
+- `examples/confidentiality_flow.py`: asymmetric confidentiality example.
 - `tests/test_softhsm_integration.py`: SoftHSM integration test.
 - `tests/test_logging_utils.py`: logging setup test.
 
