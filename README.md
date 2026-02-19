@@ -12,6 +12,7 @@ Minimal Python starter for connecting to an HSM over `PKCS#11` and performing sy
 - Supports key lifecycle workflows: versioned rotation and key wrap/unwrap.
 - Supports asymmetric key operations for CA, mTLS, and digital signing profiles.
 - Supports asymmetric confidentiality flow (public-key encrypt, private-key decrypt).
+- Supports X.509 CSR and CA certificate workflows with HSM-backed signing keys.
 
 ## Prerequisites
 
@@ -46,6 +47,18 @@ export HSM_USER_PIN_ENV="MY_CUSTOM_PIN_VAR"
 export MY_CUSTOM_PIN_VAR="1234"
 ```
 
+For root CA ceremonies, explicitly enable root operations:
+
+```bash
+export HSM_ALLOW_ROOT_CA="true"
+```
+
+Optional role separation control:
+
+```bash
+export HSM_OPERATION_ROLE="any"  # any | ca | app
+```
+
 ## Logging
 
 Both example scripts configure rotating file logging automatically.
@@ -62,11 +75,32 @@ export HSM_CLIENT_LOG_MAX_BYTES="5242880" # 5MB
 export HSM_CLIENT_LOG_BACKUP_COUNT="5"
 ```
 
+## Unified CLI Entry Point
+
+Use a single file for both symmetric and PKI workflows:
+
+```bash
+python3 examples/hsm_cli.py --mode symmetric ...
+python3 examples/hsm_cli.py --mode pki ...
+```
+
+Mode-specific help from the same file:
+
+```bash
+python3 examples/hsm_cli.py --mode symmetric --help
+python3 examples/hsm_cli.py --mode pki --help
+```
+
+Mode options:
+
+- `--mode symmetric`: AES encrypt/decrypt quick tests (basic flow behavior)
+- `--mode pki`: keygen, CSR/cert issuance, detached signing/verification, rotation planning
+
 ## Basic Flow CLI
 
-`examples/basic_flow.py` supports two modes:
+Use `examples/hsm_cli.py --mode symmetric` with these modes:
 
-- Encrypt mode (default): requires exactly one of `--message`, `--file`, or `--object`
+- Encrypt mode (default, or explicit `--encrypt`): requires exactly one of `--message`, `--file`, or `--object`
 - Decrypt mode (`--decrypt`): requires exactly one of `--payload` or `--payload-file`
 
 Output behavior:
@@ -87,25 +121,25 @@ Key label behavior:
 Encrypt a quick message:
 
 ```bash
-python3 examples/basic_flow.py --message "test payload" --out payload.json
+python3 examples/hsm_cli.py --mode symmetric --encrypt --message "test payload" --out payload.json
 ```
 
 Encrypt a file:
 
 ```bash
-python3 examples/basic_flow.py --file ./document.pdf --out document.payload.json
+python3 examples/hsm_cli.py --mode symmetric --file ./document.pdf --out document.payload.json
 ```
 
 Encrypt a JSON object:
 
 ```bash
-python3 examples/basic_flow.py --object '{"user_id":123,"role":"admin"}' --out object.payload.json
+python3 examples/hsm_cli.py --mode symmetric --object '{"user_id":123,"role":"admin"}' --out object.payload.json
 ```
 
 Optional AAD for encryption (used only when AES-GCM is selected):
 
 ```bash
-python3 examples/basic_flow.py --message "test payload" --aad "request-id=abc123" --out payload.json
+python3 examples/hsm_cli.py --mode symmetric --message "test payload" --aad "request-id=abc123" --out payload.json
 ```
 
 ### Decryption Examples
@@ -113,25 +147,25 @@ python3 examples/basic_flow.py --message "test payload" --aad "request-id=abc123
 Decrypt from payload file:
 
 ```bash
-python3 examples/basic_flow.py --decrypt --payload-file payload.json
+python3 examples/hsm_cli.py --mode symmetric --decrypt --payload-file payload.json
 ```
 
 Decrypt from inline payload JSON string:
 
 ```bash
-python3 examples/basic_flow.py --decrypt --payload '{"key_label":"app-aes-key","mechanism":"AES_GCM","iv_or_nonce_b64":"...","ciphertext_b64":"..."}'
+python3 examples/hsm_cli.py --mode symmetric --decrypt --payload '{"key_label":"app-aes-key","mechanism":"AES_GCM","iv_or_nonce_b64":"...","ciphertext_b64":"..."}'
 ```
 
 Decrypt a file payload back to bytes:
 
 ```bash
-python3 examples/basic_flow.py --decrypt --payload-file document.payload.json --out ./document.decrypted.pdf
+python3 examples/hsm_cli.py --mode symmetric --decrypt --payload-file document.payload.json --out ./document.decrypted.pdf
 ```
 
 Decrypt an object payload:
 
 ```bash
-python3 examples/basic_flow.py --decrypt --payload-file object.payload.json
+python3 examples/hsm_cli.py --mode symmetric --decrypt --payload-file object.payload.json
 ```
 
 Note: if your HSM does not support AES-GCM, the client falls back to AES-CBC-PAD only when no AAD is provided.
@@ -184,6 +218,221 @@ with Pkcs11HsmClient(config) as client:
     message = b"hello-signature"
     signature = client.sign(private_key, message, algorithm="ecdsa_sha256")
     assert client.verify(public_key, message, signature, algorithm="ecdsa_sha256")
+```
+
+## CA workflows (root + intermediate)
+
+New APIs:
+
+- `create_root_ca_key(...)`
+- `create_root_ca_cert(...)`
+- `create_intermediate_key(...)`
+- `create_csr(...)`
+- `sign_intermediate_csr(...)`
+- `sign_leaf_csr(...)`
+- `generate_mtls_leaf_key_and_csr(...)`
+- `sign_mtls_leaf_csr(...)`
+- `sign_blob(...)` / `verify_blob(...)`
+- `sign_digest(...)` / `verify_digest(...)`
+
+Root operations are policy-gated and require:
+
+- `HSM_ALLOW_ROOT_CA=true`
+- a non-empty `ceremony_reference` argument
+
+Role separation policy:
+
+- Set `HSM_OPERATION_ROLE=ca` for CA operations (certificate issuance, CA key ops).
+- Set `HSM_OPERATION_ROLE=app` for application signing operations.
+- Use `HSM_OPERATION_ROLE=any` to disable role enforcement in development.
+
+Python usage example:
+
+```python
+from hsm_client import HsmConfig, Pkcs11HsmClient
+
+config = HsmConfig.from_env()
+ceremony = "2026-q1-root-ca-ceremony"
+
+with Pkcs11HsmClient(config) as client:
+    client.create_root_ca_key(
+        private_label="root-ca-key",
+        ceremony_reference=ceremony,
+    )
+    root_cert_pem = client.create_root_ca_cert(
+        root_private_label="root-ca-key",
+        subject_common_name="Example Root CA",
+        organization="Example Org",
+        country="US",
+        ceremony_reference=ceremony,
+    )
+
+    client.create_intermediate_key(private_label="intermediate-ca-key")
+    intermediate_csr_pem = client.create_csr(
+        private_label="intermediate-ca-key",
+        subject_common_name="Example Intermediate CA",
+        organization="Example Org",
+        country="US",
+        is_ca=True,
+        ca_path_length=0,
+    )
+    intermediate_cert_pem = client.sign_intermediate_csr(
+        root_private_label="root-ca-key",
+        root_certificate_pem=root_cert_pem,
+        intermediate_csr_pem=intermediate_csr_pem,
+        ceremony_reference=ceremony,
+    )
+```
+
+## PKI CLI (CA/CSR operations)
+
+Use `examples/hsm_cli.py --mode pki` for command-line PKI operations.
+
+Current command groups:
+
+- `keygen`
+- `csr create`
+- `cert sign`
+- `sign`
+- `verify`
+- `rotation plan`
+
+Role control during CLI usage:
+
+- `export HSM_OPERATION_ROLE=ca` before CA issuance operations.
+- `export HSM_OPERATION_ROLE=app` before `sign` / `verify` and app-side key/CSR tasks.
+
+### 1) CA key generation
+
+Create root and intermediate keys:
+
+```bash
+python3 examples/hsm_cli.py --mode pki keygen \
+  --profile ca_root \
+  --private-label root-ca-key \
+  --ceremony-reference 2026-q1-root-ceremony
+
+python3 examples/hsm_cli.py --mode pki keygen \
+  --profile ca_intermediate \
+  --private-label intermediate-ca-key
+```
+
+Create root self-signed certificate:
+
+```bash
+python3 examples/hsm_cli.py --mode pki cert sign \
+  --cert-type root \
+  --issuer-private-label root-ca-key \
+  --subject-cn "Example Root CA" \
+  --org "Example Org" \
+  --country US \
+  --ca-path-length 1 \
+  --ceremony-reference 2026-q1-root-ceremony \
+  --out root-ca.pem
+```
+
+### 2) CSR creation
+
+Create intermediate CA CSR:
+
+```bash
+python3 examples/hsm_cli.py --mode pki csr create \
+  --private-label intermediate-ca-key \
+  --subject-cn "Example Intermediate CA" \
+  --org "Example Org" \
+  --country US \
+  --is-ca \
+  --ca-path-length 0 \
+  --out intermediate-ca.csr.pem
+```
+
+Create mTLS server leaf CSR:
+
+```bash
+python3 examples/hsm_cli.py --mode pki csr create \
+  --private-label mtls-server-key \
+  --subject-cn "db.internal.example" \
+  --org "Example Org" \
+  --country US \
+  --leaf-usage server \
+  --dns db.internal.example \
+  --out mtls-server.csr.pem
+```
+
+### 3) Certificate signing
+
+Sign intermediate CSR with root key:
+
+```bash
+python3 examples/hsm_cli.py --mode pki cert sign \
+  --cert-type intermediate \
+  --issuer-private-label root-ca-key \
+  --issuer-cert-file root-ca.pem \
+  --csr-file intermediate-ca.csr.pem \
+  --ceremony-reference 2026-q1-root-ceremony \
+  --ca-path-length 0 \
+  --out intermediate-ca.pem
+```
+
+Sign leaf CSR with intermediate and output full chain:
+
+```bash
+python3 examples/hsm_cli.py --mode pki cert sign \
+  --cert-type leaf-server \
+  --issuer-private-label intermediate-ca-key \
+  --issuer-cert-file intermediate-ca.pem \
+  --csr-file mtls-server.csr.pem \
+  --leaf-private-label mtls-server-key \
+  --root-cert-file root-ca.pem \
+  --out mtls-server.pem \
+  --chain-out mtls-server-chain.pem
+```
+
+Validate chain:
+
+```bash
+openssl verify -CAfile root-ca.pem -untrusted intermediate-ca.pem mtls-server.pem
+```
+
+### 4) Detached signature workflows
+
+Sign a blob and write detached signature metadata:
+
+```bash
+python3 examples/hsm_cli.py --mode pki sign \
+  --private-label app-signing-key \
+  --algorithm rsa_pss_sha256 \
+  --message "payload to sign" \
+  --out detached-signature.json
+```
+
+Verify:
+
+```bash
+python3 examples/hsm_cli.py --mode pki verify \
+  --public-label app-signing-key.pub \
+  --signature-file detached-signature.json \
+  --message "payload to sign"
+```
+
+Sign a precomputed digest:
+
+```bash
+python3 examples/hsm_cli.py --mode pki sign \
+  --private-label app-signing-key \
+  --algorithm rsa_pss_sha256 \
+  --digest-hex "<sha256-hex>" \
+  --out detached-digest-signature.json
+```
+
+### 5) Rotation plan scaffolding
+
+Render a profile rotation plan:
+
+```bash
+python3 examples/hsm_cli.py --mode pki rotation plan \
+  --profile signing \
+  --base-label app-signing-key
 ```
 
 ## Confidentiality flow (public key encrypt, private key decrypt)
@@ -246,6 +495,18 @@ Run the SoftHSM integration test:
 pytest -m integration -q
 ```
 
+Run only the CA workflow tests:
+
+```bash
+pytest -q tests/test_softhsm_integration.py -k "root_ca_operation or root_and_intermediate_ca_workflow or mtls_leaf_issue"
+```
+
+Run only the PKI CLI workflow test:
+
+```bash
+pytest -q tests/test_softhsm_integration.py -k pki_cli_root_intermediate_leaf_and_sign_verify_workflow
+```
+
 Test behavior:
 
 - Initializes an isolated SoftHSM token in a temporary directory.
@@ -256,17 +517,24 @@ Test behavior:
 - Verifies AES key wrap/unwrap flows.
 - Verifies asymmetric signing/verification for RSA and EC keys.
 - Verifies asymmetric confidentiality encrypt/decrypt flows.
+- Verifies root CA policy gate behavior and root/intermediate certificate chain flow.
+- Verifies mTLS leaf issuance and root->intermediate->leaf chain validation.
+- Verifies detached signature blob/digest workflows and role separation controls.
+- Verifies PKI CLI operations (including unified mode dispatch) against SoftHSM.
 - Skips cleanly if SoftHSM is not installed.
 
 ## Project layout
 
 - `src/hsm_client/config.py`: env-based configuration loader.
 - `src/hsm_client/asymmetric_profiles.py`: asymmetric key profile definitions.
+- `src/hsm_client/x509_ops.py`: CSR and X.509 certificate construction/signing helpers.
 - `src/hsm_client/logging_utils.py`: rotating file logging setup.
 - `src/hsm_client/pkcs11_client.py`: PKCS#11 client wrapper.
 - `examples/basic_flow.py`: end-to-end usage example.
 - `examples/key_lifecycle.py`: key rotation and wrap/unwrap example.
 - `examples/confidentiality_flow.py`: asymmetric confidentiality example.
+- `examples/hsm_cli.py`: unified entrypoint for symmetric + PKI workflows.
+- `examples/pki_cli.py`: PKI keygen/CSR/cert/sign/verify CLI workflows.
 - `tests/test_softhsm_integration.py`: SoftHSM integration test.
 - `tests/test_logging_utils.py`: logging setup test.
 

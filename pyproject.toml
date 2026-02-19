@@ -9,6 +9,7 @@ description = "Minimal Python PKCS#11 client starter for HSM-backed symmetric cr
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "asn1crypto>=1.5.1",
   "python-pkcs11>=0.7.0",
 ]
 

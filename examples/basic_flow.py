@@ -35,14 +35,20 @@ DEFAULT_KEY_LABEL = "app-aes-key"
 ENVELOPE_VERSION = 1
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Encrypt or decrypt data using an HSM key. "
             "Encryption input can be --message, --file, or --object."
         )
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--encrypt",
+        action="store_true",
+        help="Encrypt plaintext input (default mode when no mode flag is provided).",
+    )
+    mode_group.add_argument(
         "--decrypt",
         action="store_true",
         help="Decrypt from a payload envelope instead of encrypting plaintext.",
@@ -95,7 +101,7 @@ def parse_args() -> argparse.Namespace:
             "Decrypt: write plaintext output (required for binary file output)."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _decode_b64(name: str, value: str) -> bytes:
@@ -106,6 +112,9 @@ def _decode_b64(name: str, value: str) -> bytes:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if args.encrypt and args.decrypt:
+        raise ValueError("Use only one mode flag: --encrypt or --decrypt.")
+
     has_message = args.message is not None
     has_file = args.file_path is not None
     has_object = args.object_json is not None
@@ -332,8 +341,8 @@ def _run_decrypt(args: argparse.Namespace, client: Pkcs11HsmClient) -> int:
     return 0
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     try:
         _validate_args(args)
         configure_logging()

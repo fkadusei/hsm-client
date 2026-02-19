@@ -1,18 +1,42 @@
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import os
 import re
 import secrets
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import pkcs11
 import pkcs11.util.ec as ec_util
 from pkcs11 import Attribute, KeyType, Mechanism, MGF, ObjectClass
 
-from .asymmetric_profiles import AsymmetricKeyProfile, get_key_profile, list_key_profiles
+from .asymmetric_profiles import (
+    AsymmetricKeyProfile,
+    KeyRotationPlan,
+    build_rotation_plan,
+    get_key_profile,
+    list_key_profiles,
+)
 from .config import HsmConfig
 from .exceptions import HsmOperationError
+from .x509_ops import (
+    build_distinguished_name,
+    build_ca_csr_extensions,
+    build_leaf_csr_extensions,
+    create_certificate_signing_request,
+    create_self_signed_ca_certificate,
+    default_x509_signing_algorithm_for_key,
+    dump_certificate_pem,
+    dump_csr_pem,
+    load_certificate,
+    load_certificate_signing_request,
+    pkcs11_public_key_to_public_key_info,
+    sign_csr_as_ca,
+    sign_csr_as_leaf,
+)
 
 
 def _format_exception(exc: Exception) -> str:
@@ -76,6 +100,112 @@ class AsymmetricEncryptionAlgorithmSpec:
     mechanism_param: tuple[Mechanism, MGF, bytes | None] | None = None
 
 
+@dataclass(frozen=True)
+class DigestSignatureAlgorithmSpec:
+    """PKCS#11 mechanism mapping for digest-level signatures."""
+
+    key_type: KeyType
+    mechanism: Mechanism
+    digest_name: str
+    digest_size: int
+    mechanism_param: tuple[Mechanism, MGF, int] | None = None
+    digest_info_prefix: bytes | None = None
+
+
+@dataclass(frozen=True)
+class DetachedSignature:
+    """Detached signature with explicit metadata for transport and verification."""
+
+    algorithm: str
+    hash_algorithm: str
+    key_label: str
+    input_type: str
+    signature: bytes
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "version": "1",
+            "algorithm": self.algorithm,
+            "hash_algorithm": self.hash_algorithm,
+            "key_label": self.key_label,
+            "input_type": self.input_type,
+            "signature_b64": base64.b64encode(self.signature).decode("ascii"),
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, sort_keys=True)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "DetachedSignature":
+        required = {"algorithm", "hash_algorithm", "key_label", "input_type", "signature_b64"}
+        missing = [field for field in sorted(required) if field not in payload]
+        if missing:
+            raise ValueError(f"Detached signature payload missing fields: {', '.join(missing)}")
+        raw = payload["signature_b64"]
+        if not isinstance(raw, str):
+            raise ValueError("signature_b64 must be a string.")
+        try:
+            signature = base64.b64decode(raw.encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ValueError("Invalid base64 for signature_b64.") from exc
+        return cls(
+            algorithm=str(payload["algorithm"]),
+            hash_algorithm=str(payload["hash_algorithm"]),
+            key_label=str(payload["key_label"]),
+            input_type=str(payload["input_type"]),
+            signature=signature,
+        )
+
+    @classmethod
+    def from_json(cls, payload: str) -> "DetachedSignature":
+        try:
+            loaded = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Detached signature payload is not valid JSON.") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError("Detached signature payload must be a JSON object.")
+        return cls.from_dict(loaded)
+
+
+@dataclass(frozen=True)
+class IssuedMtlsLeaf:
+    """Result object for mTLS leaf issuance workflows."""
+
+    profile_name: str
+    private_key_label: str
+    public_key_label: str
+    csr_pem: bytes
+    certificate_pem: bytes
+    certificate_chain_pem: bytes
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "profile_name": self.profile_name,
+            "private_key_label": self.private_key_label,
+            "public_key_label": self.public_key_label,
+            "csr_pem": self.csr_pem.decode("utf-8"),
+            "certificate_pem": self.certificate_pem.decode("utf-8"),
+            "certificate_chain_pem": self.certificate_chain_pem.decode("utf-8"),
+        }
+
+
+@dataclass(frozen=True)
+class MtlsLeafCsrBundle:
+    """Result object for mTLS keypair generation + CSR creation."""
+
+    profile_name: str
+    private_key_label: str
+    public_key_label: str
+    csr_pem: bytes
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "profile_name": self.profile_name,
+            "private_key_label": self.private_key_label,
+            "public_key_label": self.public_key_label,
+            "csr_pem": self.csr_pem.decode("utf-8"),
+        }
+
 SIGNATURE_ALGORITHM_SPECS: dict[str, SignatureAlgorithmSpec] = {
     "rsa_pkcs1v15_sha256": SignatureAlgorithmSpec(
         key_type=KeyType.RSA,
@@ -128,6 +258,65 @@ ASYMMETRIC_ENCRYPTION_ALGORITHM_SPECS: dict[str, AsymmetricEncryptionAlgorithmSp
     ),
 }
 
+_SHA256_DIGEST_INFO_PREFIX = bytes.fromhex(
+    "3031300d060960864801650304020105000420"
+)
+_SHA384_DIGEST_INFO_PREFIX = bytes.fromhex(
+    "3041300d060960864801650304020205000430"
+)
+
+DIGEST_SIGNATURE_ALGORITHM_SPECS: dict[str, DigestSignatureAlgorithmSpec] = {
+    "rsa_pkcs1v15_sha256": DigestSignatureAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.RSA_PKCS,
+        digest_name="sha256",
+        digest_size=32,
+        digest_info_prefix=_SHA256_DIGEST_INFO_PREFIX,
+    ),
+    "rsa_pkcs1v15_sha384": DigestSignatureAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.RSA_PKCS,
+        digest_name="sha384",
+        digest_size=48,
+        digest_info_prefix=_SHA384_DIGEST_INFO_PREFIX,
+    ),
+    "rsa_pss_sha256": DigestSignatureAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.RSA_PKCS_PSS,
+        digest_name="sha256",
+        digest_size=32,
+        mechanism_param=(Mechanism.SHA256, MGF.SHA256, 32),
+    ),
+    "rsa_pss_sha384": DigestSignatureAlgorithmSpec(
+        key_type=KeyType.RSA,
+        mechanism=Mechanism.RSA_PKCS_PSS,
+        digest_name="sha384",
+        digest_size=48,
+        mechanism_param=(Mechanism.SHA384, MGF.SHA384, 48),
+    ),
+    "ecdsa_sha256": DigestSignatureAlgorithmSpec(
+        key_type=KeyType.EC,
+        mechanism=Mechanism.ECDSA,
+        digest_name="sha256",
+        digest_size=32,
+    ),
+    "ecdsa_sha384": DigestSignatureAlgorithmSpec(
+        key_type=KeyType.EC,
+        mechanism=Mechanism.ECDSA,
+        digest_name="sha384",
+        digest_size=48,
+    ),
+}
+
+_SIGNATURE_HASH_ALGORITHMS: dict[str, str] = {
+    "rsa_pkcs1v15_sha256": "sha256",
+    "rsa_pkcs1v15_sha384": "sha384",
+    "rsa_pss_sha256": "sha256",
+    "rsa_pss_sha384": "sha384",
+    "ecdsa_sha256": "sha256",
+    "ecdsa_sha384": "sha384",
+}
+
 
 def _normalize_algorithm_name(algorithm: str) -> str:
     return algorithm.strip().lower().replace("-", "_")
@@ -155,6 +344,28 @@ def _resolve_asymmetric_encryption_algorithm(
             f"Unsupported asymmetric encryption algorithm '{algorithm}'. Available: {available}"
         )
     return spec
+
+
+def _resolve_digest_signature_algorithm(algorithm: str) -> DigestSignatureAlgorithmSpec:
+    normalized = _normalize_algorithm_name(algorithm)
+    spec = DIGEST_SIGNATURE_ALGORITHM_SPECS.get(normalized)
+    if spec is None:
+        available = ", ".join(sorted(DIGEST_SIGNATURE_ALGORITHM_SPECS.keys()))
+        raise ValueError(
+            f"Unsupported digest signing algorithm '{algorithm}'. Available: {available}"
+        )
+    return spec
+
+
+def _resolve_hash_algorithm_name(algorithm: str) -> str:
+    normalized = _normalize_algorithm_name(algorithm)
+    resolved = _SIGNATURE_HASH_ALGORITHMS.get(normalized)
+    if resolved is None:
+        available = ", ".join(sorted(_SIGNATURE_HASH_ALGORITHMS.keys()))
+        raise ValueError(
+            f"Unsupported signing algorithm '{algorithm}'. Available: {available}"
+        )
+    return resolved
 
 
 class Pkcs11HsmClient:
@@ -247,6 +458,159 @@ class Pkcs11HsmClient:
     def list_asymmetric_encryption_algorithms() -> tuple[str, ...]:
         return tuple(sorted(ASYMMETRIC_ENCRYPTION_ALGORITHM_SPECS.keys()))
 
+    @staticmethod
+    def list_digest_signing_algorithms() -> tuple[str, ...]:
+        return tuple(sorted(DIGEST_SIGNATURE_ALGORITHM_SPECS.keys()))
+
+    @staticmethod
+    def build_profile_rotation_plan(
+        profile_name: str,
+        base_label: str,
+        *,
+        current_version: int | None = None,
+        version_width: int = 4,
+    ) -> KeyRotationPlan:
+        return build_rotation_plan(
+            profile_name=profile_name,
+            base_label=base_label,
+            current_version=current_version,
+            version_width=version_width,
+        )
+
+    def build_profile_rotation_plan_from_token(
+        self,
+        profile_name: str,
+        base_label: str,
+        *,
+        version_width: int = 4,
+    ) -> KeyRotationPlan:
+        pattern = re.compile(rf"^{re.escape(base_label)}-v(?P<version>\d+)$")
+        current_version: int | None = None
+        try:
+            for obj in self.session.get_objects({Attribute.CLASS: ObjectClass.PRIVATE_KEY}):
+                try:
+                    label = obj[Attribute.LABEL]
+                except Exception:
+                    continue
+                if not isinstance(label, str):
+                    continue
+                match = pattern.fullmatch(label)
+                if not match:
+                    continue
+                version = int(match.group("version"))
+                if current_version is None or version > current_version:
+                    current_version = version
+        except Exception as exc:
+            _logger.exception(
+                "Failed to derive current key version from token base_label=%s",
+                base_label,
+            )
+            raise HsmOperationError(
+                f"Failed to derive key rotation plan for '{base_label}': {_format_exception(exc)}"
+            ) from exc
+
+        return self.build_profile_rotation_plan(
+            profile_name=profile_name,
+            base_label=base_label,
+            current_version=current_version,
+            version_width=version_width,
+        )
+
+    @staticmethod
+    def root_ca_operations_enabled() -> bool:
+        value = os.environ.get("HSM_ALLOW_ROOT_CA", "")
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def operation_role() -> str:
+        value = os.environ.get("HSM_OPERATION_ROLE", "any")
+        normalized = value.strip().lower()
+        aliases = {
+            "any": "any",
+            "all": "any",
+            "ca": "ca",
+            "app": "app",
+        }
+        resolved = aliases.get(normalized)
+        if resolved is None:
+            raise HsmOperationError(
+                "Invalid HSM_OPERATION_ROLE. Use one of: any, ca, app."
+            )
+        return resolved
+
+    @classmethod
+    def _enforce_operation_role(
+        cls,
+        *,
+        required_role: str,
+        operation: str,
+    ) -> None:
+        resolved_required_role = required_role.strip().lower()
+        if resolved_required_role not in {"ca", "app"}:
+            raise ValueError(f"Unsupported required role: {required_role}")
+        active_role = cls.operation_role()
+        if active_role in {"any", resolved_required_role}:
+            _logger.info(
+                "Role policy check passed operation=%s required_role=%s active_role=%s",
+                operation,
+                resolved_required_role,
+                active_role,
+            )
+            return
+        raise HsmOperationError(
+            "Role separation policy denied operation "
+            f"'{operation}'. Required role '{resolved_required_role}', active role '{active_role}'."
+        )
+
+    @classmethod
+    def _enforce_root_ca_ceremony(
+        cls,
+        *,
+        operation: str,
+        ceremony_reference: str | None,
+    ) -> None:
+        cls._enforce_operation_role(required_role="ca", operation=operation)
+        if not cls.root_ca_operations_enabled():
+            raise HsmOperationError(
+                "Root CA operation denied by policy. "
+                "Set HSM_ALLOW_ROOT_CA=true for an approved offline ceremony."
+            )
+        if ceremony_reference is None or not ceremony_reference.strip():
+            raise HsmOperationError(
+                f"Root CA operation '{operation}' requires a non-empty ceremony_reference."
+            )
+        _logger.info(
+            "Root CA ceremony policy check passed operation=%s ceremony_reference=%s",
+            operation,
+            ceremony_reference,
+        )
+
+    @staticmethod
+    def _resolve_default_x509_signing_algorithm(
+        *,
+        private_key: pkcs11.PrivateKey,
+        public_key: pkcs11.PublicKey | None = None,
+        prefer_ca_profile: bool = False,
+    ) -> str:
+        key_type = private_key[Attribute.KEY_TYPE]
+        ec_params: bytes | None = None
+        if key_type == KeyType.EC:
+            if public_key is not None:
+                try:
+                    ec_params = public_key[Attribute.EC_PARAMS]
+                except Exception:
+                    ec_params = None
+            if ec_params is None:
+                try:
+                    ec_params = private_key[Attribute.EC_PARAMS]
+                except Exception:
+                    ec_params = None
+        return default_x509_signing_algorithm_for_key(
+            key_type=key_type,
+            ec_params=ec_params,
+            prefer_ca_profile=prefer_ca_profile,
+        )
+
     def generate_keypair_for_profile(
         self,
         profile_name: str,
@@ -286,6 +650,436 @@ class Pkcs11HsmClient:
                 key_id=key_id,
             )
         raise ValueError(f"Unsupported profile key type: {profile.key_type}")
+
+    def create_root_ca_key(
+        self,
+        private_label: str,
+        public_label: str | None = None,
+        *,
+        ceremony_reference: str,
+    ) -> tuple[pkcs11.PublicKey, pkcs11.PrivateKey]:
+        self._enforce_root_ca_ceremony(
+            operation="create_root_ca_key",
+            ceremony_reference=ceremony_reference,
+        )
+        public_key, private_key = self.generate_keypair_for_profile(
+            "ca_root",
+            private_label=private_label,
+            public_label=public_label,
+        )
+        _logger.info(
+            "Root CA key generated private_label=%s public_label=%s",
+            private_label,
+            public_label or f"{private_label}.pub",
+        )
+        return public_key, private_key
+
+    def create_intermediate_key(
+        self,
+        private_label: str,
+        public_label: str | None = None,
+    ) -> tuple[pkcs11.PublicKey, pkcs11.PrivateKey]:
+        self._enforce_operation_role(
+            required_role="ca",
+            operation="create_intermediate_key",
+        )
+        public_key, private_key = self.generate_keypair_for_profile(
+            "ca_intermediate",
+            private_label=private_label,
+            public_label=public_label,
+        )
+        _logger.info(
+            "Intermediate CA key generated private_label=%s public_label=%s",
+            private_label,
+            public_label or f"{private_label}.pub",
+        )
+        return public_key, private_key
+
+    def create_csr(
+        self,
+        *,
+        private_label: str,
+        subject_common_name: str,
+        public_label: str | None = None,
+        signing_algorithm: str | None = None,
+        organization: str | None = None,
+        organizational_unit: str | None = None,
+        country: str | None = None,
+        state_or_province: str | None = None,
+        locality: str | None = None,
+        is_ca: bool = False,
+        ca_path_length: int | None = None,
+        mtls_usage: str | None = None,
+        dns_names: list[str] | tuple[str, ...] | None = None,
+    ) -> bytes:
+        if is_ca:
+            self._enforce_operation_role(
+                required_role="ca",
+                operation="create_csr_ca",
+            )
+        resolved_public_label = public_label or f"{private_label}.pub"
+        private_key = self.get_private_key(private_label)
+        if private_key is None:
+            raise HsmOperationError(
+                f"Private key '{private_label}' was not found for CSR creation."
+            )
+        public_key = self.get_public_key(resolved_public_label)
+        if public_key is None:
+            raise HsmOperationError(
+                f"Public key '{resolved_public_label}' was not found for CSR creation."
+            )
+
+        resolved_algorithm = signing_algorithm or self._resolve_default_x509_signing_algorithm(
+            private_key=private_key,
+            public_key=public_key,
+        )
+        subject = build_distinguished_name(
+            subject_common_name,
+            organization=organization,
+            organizational_unit=organizational_unit,
+            country=country,
+            state_or_province=state_or_province,
+            locality=locality,
+        )
+        public_key_info = pkcs11_public_key_to_public_key_info(public_key)
+        requested_extensions = None
+        if is_ca:
+            requested_extensions = build_ca_csr_extensions(
+                path_length=ca_path_length,
+            )
+        elif mtls_usage is not None or dns_names:
+            requested_extensions = build_leaf_csr_extensions(
+                usage=mtls_usage or "server",
+                dns_names=dns_names,
+            )
+
+        request = create_certificate_signing_request(
+            subject=subject,
+            subject_public_key_info=public_key_info,
+            sign_tbs=lambda payload: self.sign(
+                private_key,
+                payload,
+                algorithm=resolved_algorithm,
+            ),
+            signing_algorithm=resolved_algorithm,
+            extensions=requested_extensions,
+        )
+        _logger.info(
+            "CSR generated private_label=%s subject_cn=%s algorithm=%s is_ca=%s",
+            private_label,
+            subject_common_name,
+            resolved_algorithm,
+            is_ca,
+        )
+        return dump_csr_pem(request)
+
+    def create_root_ca_cert(
+        self,
+        *,
+        root_private_label: str,
+        subject_common_name: str,
+        root_public_label: str | None = None,
+        signing_algorithm: str | None = None,
+        organization: str | None = None,
+        organizational_unit: str | None = None,
+        country: str | None = None,
+        state_or_province: str | None = None,
+        locality: str | None = None,
+        validity_days: int = 3650,
+        path_length: int | None = 1,
+        ceremony_reference: str,
+    ) -> bytes:
+        self._enforce_root_ca_ceremony(
+            operation="create_root_ca_cert",
+            ceremony_reference=ceremony_reference,
+        )
+        resolved_public_label = root_public_label or f"{root_private_label}.pub"
+        private_key = self.get_private_key(root_private_label)
+        if private_key is None:
+            raise HsmOperationError(
+                f"Root private key '{root_private_label}' was not found."
+            )
+        public_key = self.get_public_key(resolved_public_label)
+        if public_key is None:
+            raise HsmOperationError(
+                f"Root public key '{resolved_public_label}' was not found."
+            )
+
+        resolved_algorithm = signing_algorithm or self._resolve_default_x509_signing_algorithm(
+            private_key=private_key,
+            public_key=public_key,
+            prefer_ca_profile=True,
+        )
+        subject = build_distinguished_name(
+            subject_common_name,
+            organization=organization,
+            organizational_unit=organizational_unit,
+            country=country,
+            state_or_province=state_or_province,
+            locality=locality,
+        )
+        public_key_info = pkcs11_public_key_to_public_key_info(public_key)
+
+        certificate = create_self_signed_ca_certificate(
+            subject=subject,
+            subject_public_key_info=public_key_info,
+            sign_tbs=lambda payload: self.sign(
+                private_key,
+                payload,
+                algorithm=resolved_algorithm,
+            ),
+            signing_algorithm=resolved_algorithm,
+            validity_days=validity_days,
+            path_length=path_length,
+        )
+        _logger.info(
+            "Root CA certificate created root_private_label=%s algorithm=%s validity_days=%d",
+            root_private_label,
+            resolved_algorithm,
+            validity_days,
+        )
+        return dump_certificate_pem(certificate)
+
+    def sign_intermediate_csr(
+        self,
+        *,
+        root_private_label: str,
+        root_certificate_pem: bytes | str,
+        intermediate_csr_pem: bytes | str,
+        root_public_label: str | None = None,
+        signing_algorithm: str | None = None,
+        validity_days: int = 1825,
+        path_length: int | None = 0,
+        ceremony_reference: str,
+    ) -> bytes:
+        self._enforce_root_ca_ceremony(
+            operation="sign_intermediate_csr",
+            ceremony_reference=ceremony_reference,
+        )
+
+        root_private_key = self.get_private_key(root_private_label)
+        if root_private_key is None:
+            raise HsmOperationError(
+                f"Root private key '{root_private_label}' was not found."
+            )
+        root_public_key = None
+        if root_public_label is not None:
+            root_public_key = self.get_public_key(root_public_label)
+            if root_public_key is None:
+                raise HsmOperationError(
+                    f"Root public key '{root_public_label}' was not found."
+                )
+
+        resolved_algorithm = signing_algorithm or self._resolve_default_x509_signing_algorithm(
+            private_key=root_private_key,
+            public_key=root_public_key,
+            prefer_ca_profile=True,
+        )
+        issuer_certificate = load_certificate(root_certificate_pem)
+        request = load_certificate_signing_request(intermediate_csr_pem)
+
+        certificate = sign_csr_as_ca(
+            issuer_certificate=issuer_certificate,
+            request=request,
+            sign_tbs=lambda payload: self.sign(
+                root_private_key,
+                payload,
+                algorithm=resolved_algorithm,
+            ),
+            signing_algorithm=resolved_algorithm,
+            validity_days=validity_days,
+            path_length=path_length,
+        )
+        _logger.info(
+            "Intermediate CSR signed root_private_label=%s algorithm=%s validity_days=%d",
+            root_private_label,
+            resolved_algorithm,
+            validity_days,
+        )
+        return dump_certificate_pem(certificate)
+
+    @staticmethod
+    def _normalize_pem_text(data: bytes | str) -> str:
+        if isinstance(data, bytes):
+            text = data.decode("utf-8")
+        else:
+            text = data
+        return text.strip() + "\n"
+
+    def generate_mtls_leaf_key_and_csr(
+        self,
+        *,
+        profile_name: str,
+        private_label: str,
+        subject_common_name: str,
+        public_label: str | None = None,
+        organization: str | None = None,
+        organizational_unit: str | None = None,
+        country: str | None = None,
+        state_or_province: str | None = None,
+        locality: str | None = None,
+        signing_algorithm: str | None = None,
+        dns_names: list[str] | tuple[str, ...] | None = None,
+    ) -> MtlsLeafCsrBundle:
+        self._enforce_operation_role(
+            required_role="app",
+            operation="generate_mtls_leaf_key_and_csr",
+        )
+        usage_by_profile = {
+            "mtls_server": "server",
+            "mtls_client": "client",
+        }
+        usage = usage_by_profile.get(profile_name)
+        if usage is None:
+            raise ValueError(
+                "mTLS leaf profile must be one of: mtls_server, mtls_client."
+            )
+
+        resolved_public_label = public_label or f"{private_label}.pub"
+        self.generate_keypair_for_profile(
+            profile_name=profile_name,
+            private_label=private_label,
+            public_label=resolved_public_label,
+        )
+        csr_pem = self.create_csr(
+            private_label=private_label,
+            public_label=resolved_public_label,
+            subject_common_name=subject_common_name,
+            organization=organization,
+            organizational_unit=organizational_unit,
+            country=country,
+            state_or_province=state_or_province,
+            locality=locality,
+            signing_algorithm=signing_algorithm,
+            is_ca=False,
+            mtls_usage=usage,
+            dns_names=dns_names,
+        )
+        _logger.info(
+            "Generated mTLS leaf key and CSR profile=%s private_label=%s public_label=%s",
+            profile_name,
+            private_label,
+            resolved_public_label,
+        )
+        return MtlsLeafCsrBundle(
+            profile_name=profile_name,
+            private_key_label=private_label,
+            public_key_label=resolved_public_label,
+            csr_pem=csr_pem,
+        )
+
+    def sign_leaf_csr(
+        self,
+        *,
+        intermediate_private_label: str,
+        intermediate_certificate_pem: bytes | str,
+        leaf_csr_pem: bytes | str,
+        intermediate_public_label: str | None = None,
+        signing_algorithm: str | None = None,
+        validity_days: int = 397,
+        mtls_usage: str = "server",
+        dns_names: list[str] | tuple[str, ...] | None = None,
+    ) -> bytes:
+        self._enforce_operation_role(
+            required_role="ca",
+            operation="sign_leaf_csr",
+        )
+        intermediate_private_key = self.get_private_key(intermediate_private_label)
+        if intermediate_private_key is None:
+            raise HsmOperationError(
+                f"Intermediate private key '{intermediate_private_label}' was not found."
+            )
+        intermediate_public_key = None
+        if intermediate_public_label is not None:
+            intermediate_public_key = self.get_public_key(intermediate_public_label)
+            if intermediate_public_key is None:
+                raise HsmOperationError(
+                    f"Intermediate public key '{intermediate_public_label}' was not found."
+                )
+
+        resolved_algorithm = signing_algorithm or self._resolve_default_x509_signing_algorithm(
+            private_key=intermediate_private_key,
+            public_key=intermediate_public_key,
+            prefer_ca_profile=True,
+        )
+        issuer_certificate = load_certificate(intermediate_certificate_pem)
+        request = load_certificate_signing_request(leaf_csr_pem)
+        certificate = sign_csr_as_leaf(
+            issuer_certificate=issuer_certificate,
+            request=request,
+            sign_tbs=lambda payload: self.sign(
+                intermediate_private_key,
+                payload,
+                algorithm=resolved_algorithm,
+            ),
+            signing_algorithm=resolved_algorithm,
+            usage=mtls_usage,
+            validity_days=validity_days,
+            dns_names=dns_names,
+        )
+        _logger.info(
+            "Leaf CSR signed intermediate_private_label=%s algorithm=%s usage=%s validity_days=%d",
+            intermediate_private_label,
+            resolved_algorithm,
+            mtls_usage,
+            validity_days,
+        )
+        return dump_certificate_pem(certificate)
+
+    def sign_mtls_leaf_csr(
+        self,
+        *,
+        profile_name: str,
+        leaf_private_label: str,
+        leaf_csr_pem: bytes | str,
+        intermediate_private_label: str,
+        intermediate_certificate_pem: bytes | str,
+        root_certificate_pem: bytes | str | None = None,
+        leaf_public_label: str | None = None,
+        intermediate_public_label: str | None = None,
+        signing_algorithm: str | None = None,
+        validity_days: int = 397,
+        mtls_usage: str | None = None,
+        dns_names: list[str] | tuple[str, ...] | None = None,
+    ) -> IssuedMtlsLeaf:
+        usage_by_profile = {
+            "mtls_server": "server",
+            "mtls_client": "client",
+        }
+        derived_usage = usage_by_profile.get(profile_name)
+        usage = mtls_usage or derived_usage
+        if usage is None:
+            raise ValueError(
+                "mTLS leaf profile must be one of: mtls_server, mtls_client."
+            )
+        resolved_leaf_public_label = leaf_public_label or f"{leaf_private_label}.pub"
+        leaf_cert = self.sign_leaf_csr(
+            intermediate_private_label=intermediate_private_label,
+            intermediate_certificate_pem=intermediate_certificate_pem,
+            leaf_csr_pem=leaf_csr_pem,
+            intermediate_public_label=intermediate_public_label,
+            signing_algorithm=signing_algorithm,
+            validity_days=validity_days,
+            mtls_usage=usage,
+            dns_names=dns_names,
+        )
+        chain_parts = [
+            self._normalize_pem_text(leaf_cert),
+            self._normalize_pem_text(intermediate_certificate_pem),
+        ]
+        if root_certificate_pem is not None:
+            chain_parts.append(self._normalize_pem_text(root_certificate_pem))
+        chain_pem = "".join(chain_parts).encode("utf-8")
+        return IssuedMtlsLeaf(
+            profile_name=profile_name,
+            private_key_label=leaf_private_label,
+            public_key_label=resolved_leaf_public_label,
+            csr_pem=leaf_csr_pem.encode("utf-8")
+            if isinstance(leaf_csr_pem, str)
+            else leaf_csr_pem,
+            certificate_pem=leaf_cert,
+            certificate_chain_pem=chain_pem,
+        )
 
     def generate_rsa_keypair(
         self,
@@ -521,6 +1315,179 @@ class Pkcs11HsmClient:
             _logger.exception("Signature verification failed algorithm=%s", algorithm)
             raise HsmOperationError(
                 f"Verification failed for algorithm '{algorithm}': {_format_exception(exc)}"
+            ) from exc
+
+    @staticmethod
+    def _prepare_digest_payload(
+        *,
+        spec: DigestSignatureAlgorithmSpec,
+        digest: bytes,
+    ) -> bytes:
+        if len(digest) != spec.digest_size:
+            raise ValueError(
+                f"Digest length mismatch for {spec.digest_name}: "
+                f"expected {spec.digest_size} bytes, got {len(digest)}."
+            )
+        if spec.digest_info_prefix is not None:
+            return spec.digest_info_prefix + digest
+        return digest
+
+    def sign_blob(
+        self,
+        *,
+        private_label: str,
+        blob: bytes,
+        algorithm: str = "rsa_pss_sha256",
+    ) -> DetachedSignature:
+        self._enforce_operation_role(required_role="app", operation="sign_blob")
+        private_key = self.get_private_key(private_label)
+        if private_key is None:
+            raise HsmOperationError(f"Private key '{private_label}' was not found.")
+        signature = self.sign(
+            private_key,
+            blob,
+            algorithm=algorithm,
+        )
+        resolved_algorithm = _normalize_algorithm_name(algorithm)
+        detached = DetachedSignature(
+            algorithm=resolved_algorithm,
+            hash_algorithm=_resolve_hash_algorithm_name(resolved_algorithm),
+            key_label=private_label,
+            input_type="blob",
+            signature=signature,
+        )
+        _logger.info(
+            "sign_blob complete key_label=%s algorithm=%s signature_size=%d",
+            private_label,
+            resolved_algorithm,
+            len(signature),
+        )
+        return detached
+
+    def verify_blob(
+        self,
+        *,
+        public_label: str,
+        blob: bytes,
+        detached_signature: DetachedSignature,
+    ) -> bool:
+        self._enforce_operation_role(required_role="app", operation="verify_blob")
+        if detached_signature.input_type != "blob":
+            raise ValueError(
+                "Detached signature input_type mismatch; expected 'blob'."
+            )
+        public_key = self.get_public_key(public_label)
+        if public_key is None:
+            raise HsmOperationError(f"Public key '{public_label}' was not found.")
+        verified = self.verify(
+            public_key,
+            blob,
+            detached_signature.signature,
+            algorithm=detached_signature.algorithm,
+        )
+        _logger.info(
+            "verify_blob result=%s key_label=%s algorithm=%s",
+            verified,
+            public_label,
+            detached_signature.algorithm,
+        )
+        return verified
+
+    def sign_digest(
+        self,
+        *,
+        private_label: str,
+        digest: bytes,
+        algorithm: str = "rsa_pss_sha256",
+    ) -> DetachedSignature:
+        self._enforce_operation_role(required_role="app", operation="sign_digest")
+        spec = _resolve_digest_signature_algorithm(algorithm)
+        private_key = self.get_private_key(private_label, key_type=spec.key_type)
+        if private_key is None:
+            raise HsmOperationError(
+                f"Private key '{private_label}' was not found for {spec.key_type.name}."
+            )
+        payload = self._prepare_digest_payload(spec=spec, digest=digest)
+        try:
+            signature = private_key.sign(
+                payload,
+                mechanism=spec.mechanism,
+                mechanism_param=spec.mechanism_param,
+            )
+        except Exception as exc:
+            _logger.exception(
+                "sign_digest failed key_label=%s algorithm=%s",
+                private_label,
+                _normalize_algorithm_name(algorithm),
+            )
+            raise HsmOperationError(
+                f"Digest signing failed for algorithm '{algorithm}': {_format_exception(exc)}"
+            ) from exc
+
+        resolved_algorithm = _normalize_algorithm_name(algorithm)
+        detached = DetachedSignature(
+            algorithm=resolved_algorithm,
+            hash_algorithm=spec.digest_name,
+            key_label=private_label,
+            input_type="digest",
+            signature=signature,
+        )
+        _logger.info(
+            "sign_digest complete key_label=%s algorithm=%s signature_size=%d",
+            private_label,
+            resolved_algorithm,
+            len(signature),
+        )
+        return detached
+
+    def verify_digest(
+        self,
+        *,
+        public_label: str,
+        digest: bytes,
+        detached_signature: DetachedSignature,
+    ) -> bool:
+        self._enforce_operation_role(required_role="app", operation="verify_digest")
+        if detached_signature.input_type != "digest":
+            raise ValueError(
+                "Detached signature input_type mismatch; expected 'digest'."
+            )
+        spec = _resolve_digest_signature_algorithm(detached_signature.algorithm)
+        public_key = self.get_public_key(public_label, key_type=spec.key_type)
+        if public_key is None:
+            raise HsmOperationError(
+                f"Public key '{public_label}' was not found for {spec.key_type.name}."
+            )
+        payload = self._prepare_digest_payload(spec=spec, digest=digest)
+        try:
+            verified = public_key.verify(
+                payload,
+                detached_signature.signature,
+                mechanism=spec.mechanism,
+                mechanism_param=spec.mechanism_param,
+            )
+            _logger.info(
+                "verify_digest result=%s key_label=%s algorithm=%s",
+                bool(verified),
+                public_label,
+                detached_signature.algorithm,
+            )
+            return bool(verified)
+        except pkcs11.exceptions.SignatureInvalid:
+            _logger.warning(
+                "verify_digest invalid signature key_label=%s algorithm=%s",
+                public_label,
+                detached_signature.algorithm,
+            )
+            return False
+        except Exception as exc:
+            _logger.exception(
+                "verify_digest failed key_label=%s algorithm=%s",
+                public_label,
+                detached_signature.algorithm,
+            )
+            raise HsmOperationError(
+                f"Digest verification failed for algorithm '{detached_signature.algorithm}': {_format_exception(exc)}"
             ) from exc
 
     def encrypt_confidential(
